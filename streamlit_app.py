@@ -13,7 +13,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- 設定繪圖風格 ---
+# --- 設定繪圖風格 (解決亂碼) ---
 plt.style.use('seaborn-v0_8-whitegrid')
 plt.rcParams['font.family'] = ['sans-serif'] 
 plt.rcParams['axes.unicode_minus'] = False
@@ -33,7 +33,7 @@ def format_num(value, currency=False, percent=False, decimal=2):
 # --- 1. 資料獲取層 ---
 
 def calculate_one_year_beta(ticker):
-    """計算 1 年期 Beta"""
+    """計算 1 年期 Beta (相對於 S&P 500)"""
     period = "1y"
     try:
         stock_history = yf.download(ticker, period=period, progress=False, auto_adjust=True)
@@ -68,14 +68,14 @@ def get_stock_data(ticker):
         stock = yf.Ticker(ticker)
         info = stock.info
         
+        # 獲取 3 年歷史數據
         history = stock.history(period="3y", interval="1d", auto_adjust=True) 
         
         financials_q = stock.quarterly_financials
         balance_sheet_q = stock.quarterly_balance_sheet
         cashflow_q = stock.quarterly_cashflow
         
-        if not info or history.empty or financials_q.empty:
-            return None
+        if not info or history.empty: return None
 
         current_price = history['Close'].iloc[-1]
         
@@ -123,571 +123,336 @@ def get_key_indicators_df(data):
     
     return pd.DataFrame(list(indicators.items()), columns=['指標', '數值'])
 
-
 def get_quarterly_valuation_df(data):
-    """計算季度（用近 5 季）每股倍數（P/E, P/S, P/B），修正：以每股為基準計算倍數（price / EPS），而非直接 market_cap / net_income（避免單位或股本差異）。"""
+    """
+    計算季度估值趨勢與歷史倍數。
+    *** 核心邏輯：鎖定最近 5 季 ***
+    """
     info = data['info']
     history = data['history']
-    shares = info.get('sharesOutstanding', np.nan)
+    shares = info.get('sharesOutstanding', 1)
     fq = data['financials_q']
-    bq = data['balance_sheet_q']
     
-    if 'Net Income' not in fq.index:
-        return None, {}, {}
+    if fq.empty or 'Net Income' not in fq.index:
+        return pd.DataFrame(), {}, {'shares': shares}
 
-    # 取得季度淨利與營收（已按時間由舊到新排序）
-    net_income_q = fq.loc['Net Income'].sort_index(ascending=True)
-    rev_q = fq.loc['Total Revenue'].sort_index(ascending=True) if 'Total Revenue' in fq.index else pd.Series(dtype=float)
+    # 1. 準備數據 (由新到舊 -> 轉為舊到新以計算 Rolling)
+    net_income_q = fq.loc['Net Income'].sort_index(ascending=True).fillna(0)
+    rev_q = fq.loc['Total Revenue'].sort_index(ascending=True).fillna(0) if 'Total Revenue' in fq.index else pd.Series()
+    
+    # 2. 計算 TTM (滾動 4 季總和)
+    # 智慧填補：若 TTM 數據不足(例如最早的幾季)，使用單季 x 4 作為近似，確保能湊滿 5 季
+    ttm_net_income = net_income_q.rolling(window=4).sum().fillna(net_income_q * 4)
+    ttm_rev = rev_q.rolling(window=4).sum().fillna(rev_q * 4)
 
-    # 計算 TTM（每季最後一季為基準）
-    ttm_net_income = net_income_q.rolling(window=4).sum().dropna()
-    ttm_rev = rev_q.rolling(window=4).sum().dropna()
-
-    # 取最近最多 5 個可用的 TTM 時點
-    dates = list(ttm_net_income.index)[-5:]
-    if not dates:
-        return None, {}, {}
-
-    metrics_list = []
-    historical_multiples = {'PE': [], 'PB': [], 'PS': []}
+    # 轉回新到舊
+    ttm_net_income = ttm_net_income.sort_index(ascending=False)
+    ttm_rev = ttm_rev.sort_index(ascending=False)
 
     history_idx = pd.to_datetime(history.index).tz_localize(None)
+    
+    # *** 鎖定最近 5 季 ***
+    dates = sorted(ttm_net_income.index, reverse=True)[:5]
+    
+    metrics = []
+    multiples = {'PE': [], 'PB': [], 'PS': []}
 
-    for date in reversed(dates):  # 從近到遠
+    for date in dates:
+        # 找當季結束時的股價
         try:
             target_idx = history_idx.get_indexer([pd.to_datetime(date)], method='nearest')[0]
-            quarter_price = history['Close'].iloc[target_idx] if target_idx != -1 else np.nan
-        except:
-            quarter_price = np.nan
-        if pd.isna(quarter_price):
-            continue
+            price = history['Close'].iloc[target_idx] if target_idx != -1 else np.nan
+        except: price = np.nan
+            
+        if pd.isna(price): continue
 
-        net_inc_val = ttm_net_income.loc[date]
+        # 獲取數據
+        ni_val = ttm_net_income.loc[date]
         rev_val = ttm_rev.loc[date] if date in ttm_rev.index else np.nan
-
-        # 從資產負債表抓取當季股東權益（若有）
-        def get_val(df, key_list, idx=date):
-            if df is None or df.empty: return np.nan
-            if isinstance(key_list, str): key_list = [key_list]
-            for key in key_list:
-                if key in df.index and idx in df.columns:
-                    return df.loc[key, idx]
-            # 若同一日期找不到，嘗試用最近可用的欄位
-            for key in key_list:
-                if key in df.index:
-                    # 找最近可用欄位
-                    try:
-                        nearest = df.columns.get_indexer([idx], method='nearest')[0]
-                        return df.loc[key, df.columns[nearest]]
-                    except: pass
-            return np.nan
-
-        equity = get_val(bq, ['Stockholders Equity', 'Total Stockholder Equity', 'Total Equity Gross Minority Interest'], date)
-
-        # 計算每股數值
-        if pd.isna(shares) or shares == 0:
-            # 若 shares 無法取得，改採 info['marketCap'] 與每股替代
-            shares = info.get('sharesOutstanding', np.nan)
-
-        # EPS (TTM) 與 RPS (TTM) 以每股為基礎
-        eps_ttm = (net_inc_val / shares) if pd.notna(net_inc_val) and pd.notna(shares) and shares > 0 else np.nan
-        rps_ttm = (rev_val / shares) if pd.notna(rev_val) and pd.notna(shares) and shares > 0 else np.nan
-        bvps_mrq = (equity / shares) if pd.notna(equity) and pd.notna(shares) and shares > 0 else np.nan
-
-        # 傳統每股倍數計算（price / per-share-metric）
-        pe = quarter_price / eps_ttm if pd.notna(eps_ttm) and eps_ttm > 0 else np.nan
-        ps = quarter_price / rps_ttm if pd.notna(rps_ttm) and rps_ttm > 0 else np.nan
-        pb = quarter_price / bvps_mrq if pd.notna(bvps_mrq) and bvps_mrq > 0 else np.nan
-
-        # EV/EBITDA 保留 market-cap 方式
-        mc = quarter_price * shares if pd.notna(shares) and shares > 0 else (info.get('marketCap') or np.nan)
-        debt = get_val(bq, 'Total Debt', date)
-        cash = get_val(bq, ['Cash', 'Cash And Cash Equivalents'], date)
-        ev = mc + (debt if pd.notna(debt) else 0) - (cash if pd.notna(cash) else 0)
-        ebitda = get_val(fq, ['Ebitda', 'EBITDA'], date)
-        ev_ebitda = ev / (ebitda * 4) if pd.notna(ebitda) and ebitda > 0 else np.nan
-
-        if pd.notna(pe): historical_multiples['PE'].append(pe)
-        if pd.notna(ps): historical_multiples['PS'].append(ps)
-        if pd.notna(pb): historical_multiples['PB'].append(pb)
-
-        metrics_list.append({
-            '季度': pd.to_datetime(date).strftime('%Y-%m-%d'),
-            '價格 (當時)': f"${quarter_price:.2f}",
-            'P/E (TTM)': format_num(pe, decimal=1) if pd.notna(pe) else '-',
-            'P/S (TTM)': format_num(ps, decimal=1) if pd.notna(ps) else '-',
-            'P/B (MRQ)': format_num(pb, decimal=1) if pd.notna(pb) else '-',
-            'EV/EBITDA': format_num(ev_ebitda, decimal=1) if pd.notna(ev_ebitda) else '-',
-        })
-
-    return pd.DataFrame(metrics_list), historical_multiples, {'shares': shares}
-
-
-def get_financial_summary_with_growth(data):
-    fq = data['financials_q']
-    bq = data['balance_sheet_q']
-    
-    if 'Total Revenue' not in fq.index: return None, None
-
-    def calculate_growth(series):
-        series = series.sort_index(ascending=True)
-        qoq_growth = {}
-        yoy_growth = {}
-        for date in series.index:
-            current_value = series.loc[date]
-            # QoQ
-            try:
-                prev_loc = series.index.get_loc(date) - 1
-                if prev_loc >= 0:
-                    prev_val = series.iloc[prev_loc]
-                    if pd.notna(current_value) and pd.notna(prev_val) and prev_val != 0:
-                        qoq_growth[date] = (current_value - prev_val) / abs(prev_val)
-            except: pass
-            # YoY
-            target_date = date - timedelta(days=360)
-            try:
-                nearest_idx = series.index.get_indexer([target_date], method='nearest')[0]
-                if nearest_idx != -1 and abs((series.index[nearest_idx] - target_date).days) < 45:
-                    prev_val = series.iloc[nearest_idx]
-                    if pd.notna(current_value) and pd.notna(prev_val) and prev_val != 0:
-                        yoy_growth[date] = (current_value - prev_val) / abs(prev_val)
-            except: pass
-        return pd.Series(qoq_growth), pd.Series(yoy_growth)
-
-    revenue_q = fq.loc['Total Revenue']
-    net_income_q = fq.loc['Net Income'] if 'Net Income' in fq.index else pd.Series(dtype=float)
-
-    rev_qoq, rev_yoy = calculate_growth(revenue_q)
-    ni_qoq, ni_yoy = calculate_growth(net_income_q)
-    
-    recent_cols = fq.columns[:5]
-    
-    # 構建損益表
-    income_rows = ['Total Revenue', 'Gross Profit', 'Cost Of Revenue', 'Operating Income', 'Net Income', 'Basic EPS']
-    income_rows = [r for r in income_rows if r in fq.index]
-    income_df = fq.loc[income_rows, fq.columns.intersection(recent_cols)].copy()
-    
-    if 'Gross Profit' not in income_df.index and 'Total Revenue' in income_df.index and 'Cost Of Revenue' in income_df.index:
-        income_df.loc['Gross Profit'] = income_df.loc['Total Revenue'] - income_df.loc['Cost Of Revenue']
-
-    income_df = income_df.T
-    income_df['Revenue YoY'] = rev_yoy.reindex(income_df.index).values
-    income_df['Revenue QoQ'] = rev_qoq.reindex(income_df.index).values
-    income_df['Net Income YoY'] = ni_yoy.reindex(income_df.index).values
-    income_df['Net Income QoQ'] = ni_qoq.reindex(income_df.index).values
-    income_df = income_df.T
-
-    bs_rows = ['Total Assets', 'Total Liabilities Net Minority Interest', 'Stockholders Equity', 'Total Debt']
-    bs_rows = [r for r in bs_rows if r in bq.index]
-    bs_df = bq.loc[bs_rows, bq.columns.intersection(recent_cols)]
-
-    fmt_cols = [d.strftime('%Y-%m-%d') for d in recent_cols]
-    if not income_df.empty: income_df.columns = fmt_cols
-    if not bs_df.empty: bs_df.columns = fmt_cols
-
-    return income_df, bs_df
-
-
-def calculate_valuation_models(data, income_df, historical_multiples, extra_data, custom_g=None):
-    info = data['info']
-    shares = extra_data.get('shares', info.get('sharesOutstanding', np.nan))
-    
-    # 1. 優先使用 info 中的 TTM EPS (與 Key Indicators 一致)
-    ttm_eps = info.get('trailingEps')
-    
-    # 2. 如果 info 缺失，則使用財報計算 (Net Income TTM / shares)
-    if pd.isna(ttm_eps) or ttm_eps == 0:
+        
+        # 股東權益
         try:
-            if 'Net Income' in data['financials_q'].index:
-                net_ttm = data['financials_q'].loc['Net Income'].iloc[:4].sum()
-                if pd.notna(net_ttm) and pd.notna(shares) and shares > 0:
-                    ttm_eps = net_ttm / shares
-        except: pass
+            equity = data['balance_sheet_q'].loc['Stockholders Equity', date]
+        except: 
+            try: equity = data['balance_sheet_q'].loc['Total Equity Gross Minority Interest', date]
+            except: equity = np.nan
 
-    # RPS (TTM)
+        # EBITDA
+        try:
+            ebitda = data['financials_q'].loc['EBITDA', date] * 4 # 年化
+        except: 
+            try: ebitda = data['financials_q'].loc['Ebitda', date] * 4
+            except: ebitda = np.nan
+
+        mc = price * shares
+        
+        # 計算倍數
+        pe = mc / ni_val if ni_val > 0 else np.nan
+        ps = mc / rev_val if rev_val > 0 else np.nan
+        pb = mc / equity if equity > 0 else np.nan
+        
+        # 收集有效倍數
+        if pd.notna(pe) and 0 < pe < 200: multiples['PE'].append(pe)
+        if pd.notna(ps) and 0 < ps < 100: multiples['PS'].append(ps)
+        if pd.notna(pb) and 0 < pb < 100: multiples['PB'].append(pb)
+
+        metrics.append({
+            '季度': date.strftime('%Y-%m-%d'),
+            '市值': mc,
+            'P/E (TTM)': pe,
+            'P/S (TTM)': ps,
+            'P/B (MRQ)': pb,
+            'EV/EBITDA': mc / ebitda if ebitda > 0 else np.nan
+        })
+    
+    return pd.DataFrame(metrics), multiples, {'shares': shares}
+
+def get_income_statement(data):
+    """獲取損益表並計算成長率"""
+    fq = data['financials_q']
+    if fq.empty: return pd.DataFrame()
+    
+    # 選取欄位
+    target_rows = ['Total Revenue', 'Gross Profit', 'Operating Income', 'Net Income', 'Basic EPS']
+    rows = []
+    for t in target_rows:
+        found = [i for i in fq.index if t in i]
+        if found: rows.append(found[0])
+    
+    df = fq.loc[rows].copy()
+    
+    # 計算成長率
+    df_sorted = df.sort_index(axis=1, ascending=True)
+    qoq = df_sorted.pct_change(axis=1)
+    yoy = df_sorted.pct_change(axis=1, periods=4) # YoY 嚴格比較去年同季
+    
+    # 轉回新到舊
+    df = df.sort_index(axis=1, ascending=False)
+    qoq = qoq.sort_index(axis=1, ascending=False)
+    yoy = yoy.sort_index(axis=1, ascending=False)
+    
+    final_df = df.T
+    
+    def get_growth(growth_df, row_name):
+        try: return growth_df.loc[row_name]
+        except: return pd.Series([np.nan]*len(final_df), index=final_df.index)
+
+    rev_idx = [i for i in fq.index if 'Total Revenue' in i][0]
+    ni_idx = [i for i in fq.index if 'Net Income' in i][0]
+
+    final_df['營收 YoY'] = get_growth(yoy, rev_idx)
+    final_df['營收 QoQ'] = get_growth(qoq, rev_idx)
+    final_df['淨利 YoY'] = get_growth(yoy, ni_idx)
+    final_df['淨利 QoQ'] = get_growth(qoq, ni_idx)
+    
+    col_map = {
+        rev_idx: '營收', 
+        [i for i in fq.index if 'Gross Profit' in i][0]: '毛利',
+        [i for i in fq.index if 'Operating Income' in i][0]: '營業利益',
+        ni_idx: '淨利',
+        [i for i in fq.index if 'Basic EPS' in i][0]: 'EPS'
+    }
+    final_df = final_df.rename(columns=col_map)
+    
+    return final_df.head(5).T
+
+def calculate_valuation(data, income_df, multiples, custom_g):
+    info = data['info']
+    shares = info.get('sharesOutstanding', 1)
+    
+    # 基礎數據 (優先用 TTM 計算)
     try:
-        rev_ttm = data['financials_q'].loc['Total Revenue'].iloc[:4].sum()
-        ttm_rps = rev_ttm / shares if pd.notna(shares) and shares > 0 else np.nan
+        ttm_eps = data['financials_q'].loc['Basic EPS'].iloc[:4].sum()
+    except: ttm_eps = info.get('trailingEps')
+    
+    try:
+        ttm_rev = data['financials_q'].loc['Total Revenue'].iloc[:4].sum()
+        ttm_rps = ttm_rev / shares
     except: ttm_rps = np.nan
     
-    # BVPS (MRQ)
     try:
-        equity = data['balance_sheet_q'].loc['Stockholders Equity'].iloc[0]
-        bvps = equity / shares if pd.notna(shares) and shares > 0 else (info.get('bookValue') or np.nan)
+        # 尋找最近一季的股東權益
+        eq_rows = [i for i in data['balance_sheet_q'].index if 'Stockholders Equity' in i or 'Total Equity' in i]
+        mrq_equity = data['balance_sheet_q'].loc[eq_rows[0]].iloc[0] if eq_rows else np.nan
+        bvps = mrq_equity / shares
     except: bvps = info.get('bookValue')
 
-    def get_growth(row_name, info_key):
-        rate = np.nan
-        try:
-            if row_name in income_df.index: rate = income_df.loc[row_name].iloc[0]
-        except: pass
-        if pd.isna(rate): rate = info.get(info_key)
-        return rate
-
-    rev_growth = get_growth('Revenue YoY', 'revenueGrowth')
-    ni_growth = get_growth('Net Income YoY', 'earningsGrowth')
+    # 成長率
+    try: rev_g = income_df.loc['營收 YoY'].iloc[0]
+    except: rev_g = info.get('revenueGrowth', 0)
+    
+    try: ni_g = income_df.loc['淨利 YoY'].iloc[0]
+    except: ni_g = info.get('earningsGrowth', 0)
 
     results = []
     
-    def add_model(name, base, growth, multiples, metric_name):
-        if pd.isna(base) or not multiples: return
-        valid_m = [m for m in multiples if m > 0]
+    def add_row(name, base, growth, hist_list):
+        if pd.isna(base) or not hist_list: return
+        
+        # 計算近 5 季的平均與標準差
+        valid_m = [m for m in hist_list if m > 0]
         if not valid_m: return
         
         avg = np.mean(valid_m)
         std = np.std(valid_m)
-        if pd.isna(std) or std == 0: std = avg * 0.1
-        
-        low_m = max(0, avg - std)
-        high_m = avg + std
+        if pd.isna(std): std = avg * 0.15
         
         g = growth if pd.notna(growth) else 0
-        proj_val = base * (1 + g)
-        price_low = proj_val * low_m
-        price_high = proj_val * high_m
+        
+        # 估值公式: 基礎 * (1+g) * 倍數
+        target = base * (1 + g) * avg
+        low = base * (1 + g) * max(0, avg - std)
+        high = base * (1 + g) * (avg + std)
         
         results.append({
             '模型': name,
-            '基礎指標': f"{metric_name}: ${base:.2f}",
-            '成長率': f"{g:.1%}",
-            '倍數區間 (Avg±SD)': f"{avg:.1f}x ± {std:.1f}",
-            '預估股價區間': f"${price_low:.2f} - ${price_high:.2f}",
-            'Low': price_low, 
+            '基礎指標': base,
+            '成長率': g,
+            '近5季倍數 (Avg±SD)': f"{avg:.1f}x ± {std:.1f}",
+            '估值下限': low,
+            '估值上限': high,
+            '目標價': target
         })
 
-    add_model("P/E (本益比)", ttm_eps, ni_growth, historical_multiples.get('PE'), "EPS (TTM)")
-    add_model("P/S (股價營收比)", ttm_rps, rev_growth, historical_multiples.get('PS'), "RPS (TTM)")
+    add_row("P/E (本益比)", ttm_eps, ni_g, multiples.get('PE'))
+    add_row("P/S (營收比)", ttm_rps, rev_g, multiples.get('PS'))
+    add_row("P/B (淨值比)", bvps, rev_g * 0.5, multiples.get('PB')) 
     
-    pb_growth = rev_growth * 0.5 if pd.notna(rev_growth) else 0
-    add_model("P/B (股價淨值比)", bvps, pb_growth, historical_multiples.get('PB'), "BVPS (MRQ)")
-    
-    if custom_g is not None and pd.notna(ttm_eps):
-        add_model(f"自定義 ({custom_g:.1%})", ttm_eps, custom_g, historical_multiples.get('PE'), "EPS (TTM)")
+    if custom_g:
+        add_row(f"自定義 ({custom_g}%)", ttm_eps, custom_g/100, multiples.get('PE'))
 
     return pd.DataFrame(results)
 
-
-def analyze_health(data, income_df):
-    info = data['info']
-    score = 0
-    checks = []
-    
-    roe = info.get('returnOnEquity', 0)
-    if roe and roe > 0.15:
-        score += 1
-        checks.append(("✅", f"ROE 優秀: {roe:.1%} (>15%)"))
-    else:
-        checks.append(("⚠️", f"ROE 偏低: {roe:.1%}" if roe else "無 ROE 數據"))
-        
-    pm = info.get('profitMargins', 0)
-    if pm > 0.10:
-        score += 1
-        checks.append(("✅", f"淨利率健康: {pm:.1%} (>10%)"))
-    else:
-        checks.append(("⚠️", f"淨利率偏低: {pm:.1%}"))
-
-    try:
-        rev_yoy = income_df.loc['Revenue YoY'].iloc[0]
-        if rev_yoy > 0:
-            score += 1
-            checks.append(("✅", f"營收正成長: {rev_yoy:.1%}"))
-        else:
-            checks.append(("⚠️", f"營收衰退: {rev_yoy:.1%}"))
-    except:
-        checks.append(("⚪", "無法判斷營收成長"))
-
-    de = info.get('debtToEquity', 0)
-    if de and de < 200:
-        score += 1
-        checks.append(("✅", f"負債比率可控: {de}% (<200%)"))
-    else:
-        checks.append(("⚠️", f"負債比率偏高: {de}%"))
-        
-    fcf = info.get('freeCashflow', 0)
-    if fcf and fcf > 0:
-        score += 1
-        checks.append(("✅", "自由現金流為正"))
-    else:
-        checks.append(("⚠️", "自由現金流為負或無數據"))
-
-    return score, checks
-
 # --- 3. 繪圖函式 ---
 
-def plot_financial_trends(data, income_df, bs_df, ticker):
-    if income_df is None or income_df.empty: return None
-    
+def plot_charts(data, income_df, ticker):
     dates = [datetime.strptime(d, '%Y-%m-%d') for d in income_df.columns][::-1]
     
-    def get_d(name):
-        return income_df.loc[name].values[::-1] if name in income_df.index else np.zeros(len(dates))
+    def get_series(row_name):
+        if row_name in income_df.index:
+            return income_df.loc[row_name].values[::-1]
+        return np.zeros(len(dates))
 
-    rev = get_d('Total Revenue')
-    gross = get_d('Gross Profit')
-    op_inc = get_d('Operating Income')
-    net_inc = get_d('Net Income')
-    eps = get_d('Basic EPS')
-    debt = bs_df.loc['Total Debt'].values[::-1] if not bs_df.empty and 'Total Debt' in bs_df.index else np.zeros(len(dates))
-    equity = bs_df.loc['Stockholders Equity'].values[::-1] if not bs_df.empty and 'Stockholders Equity' in bs_df.index else np.zeros(len(dates))
+    rev = get_series('營收')
+    net_inc = get_series('淨利')
+    eps = get_series('EPS')
     
     shares = data['info'].get('sharesOutstanding', 1)
-    history = data['history']
+    hist = data['history']
     market_caps = []
-    
     for d in dates:
         try:
-            idx = history.index.get_indexer([d], method='nearest')[0]
-            price = history['Close'].iloc[idx]
+            idx = hist.index.get_indexer([d], method='nearest')[0]
+            price = hist['Close'].iloc[idx]
             market_caps.append(price * shares)
         except: market_caps.append(np.nan)
-    market_caps = np.array(market_caps)
     
+    # 修正 P/S 計算: 市值 / (季營收 * 4)
     rev_float = rev.astype(float)
     ps_ratio = np.divide(market_caps, (rev_float * 4), out=np.full_like(market_caps, np.nan), where=rev_float>0)
 
-    gross_margin = np.divide(gross, rev_float, out=np.full_like(rev_float, np.nan), where=rev_float>0) * 100
-    op_margin = np.divide(op_inc, rev_float, out=np.full_like(rev_float, np.nan), where=rev_float>0) * 100
-    net_margin = np.divide(net_inc, rev_float, out=np.full_like(rev_float, np.nan), where=rev_float>0) * 100
-    if np.all(gross == 0): gross_margin[:] = np.nan
-
-    fig, axes = plt.subplots(4, 1, figsize=(10, 20))
-    plt.subplots_adjust(hspace=0.4)
-
-    # Chart 1: Revenue & P/S
-    ax1 = axes[0]
-    ax1.bar(dates, rev/1e9, color='#A8D5BA', label='Revenue (B)', width=20, alpha=0.8)
-    ax1.set_ylabel('Revenue ($B)', color='#2E8B57', fontweight='bold')
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 12))
     
+    # 圖 1: 營收與 P/S (雙軸)
+    ax1.bar(dates, rev/1e9, color='#A8D5BA', width=20, label='Revenue (B)')
+    ax1.set_ylabel('Revenue ($B)', color='green')
+    
+    # 智慧隱藏 P/S
     if not np.isnan(ps_ratio).all() and np.nanmax(ps_ratio) > 0:
         ax1_r = ax1.twinx()
-        ax1_r.plot(dates, ps_ratio, marker='o', linestyle='-', linewidth=2, label='P/S Ratio')
-        ax1_r.set_ylabel('P/S Ratio', fontweight='bold')
+        ax1_r.plot(dates, ps_ratio, color='purple', marker='o', label='P/S Ratio')
+        ax1_r.set_ylabel('P/S Ratio', color='purple')
         lines, labels = ax1.get_legend_handles_labels()
         lines2, labels2 = ax1_r.get_legend_handles_labels()
         ax1.legend(lines + lines2, labels + labels2, loc='upper left')
     else:
         ax1.legend(loc='upper left')
         
-    ax1.set_title(f'{ticker} - Revenue & P/S Trend', fontsize=12, fontweight='bold')
+    ax1.set_title(f'{ticker} Revenue & P/S Trend')
+    
+    # 圖 2: 淨利與 EPS (雙軸)
+    ax2.bar(dates, net_inc/1e9, color='#87CEFA', width=20, label='Net Income (B)')
+    ax2.set_ylabel('Net Income ($B)', color='blue')
+    ax2_r = ax2.twinx()
+    ax2_r.plot(dates, eps, color='orange', marker='o', label='EPS')
+    ax2_r.set_ylabel('EPS ($)', color='orange')
+    ax2.set_title(f'{ticker} Net Income & EPS Trend')
+    
+    lines, labels = ax2.get_legend_handles_labels()
+    lines2, labels2 = ax2_r.get_legend_handles_labels()
+    ax2.legend(lines + lines2, labels + labels2, loc='upper left')
 
-    # Chart 2: Margins
-    ax2 = axes[1]
-    if not np.isnan(gross_margin).all():
-        ax2.plot(dates, gross_margin, marker='o', linestyle='-', label='Gross Margin')
-    ax2.plot(dates, op_margin, marker='s', linestyle='--', label='Operating Margin')
-    ax2.plot(dates, net_margin, marker='^', linestyle='-.', label='Net Margin')
-    ax2.set_ylabel('Percentage (%)', fontweight='bold')
-    ax2.set_title('Profitability Margins', fontsize=12, fontweight='bold')
-    ax2.legend()
-
-    # Chart 3: Net Income & EPS
-    ax3 = axes[2]
-    ax3.bar(dates, net_inc/1e9, color='#87CEFA', label='Net Income (B)', width=20, alpha=0.8)
-    ax3.set_ylabel('Net Income ($B)', color='#2E8B57', fontweight='bold')
-    ax3_r = ax3.twinx()
-    ax3_r.plot(dates, eps, marker='o', linewidth=2, label='EPS')
-    ax3_r.set_ylabel('EPS ($)', fontweight='bold')
-    ax3.set_title('Net Income & EPS Trend', fontsize=12, fontweight='bold')
-    lines, labels = ax3.get_legend_handles_labels()
-    lines2, labels2 = ax3_r.get_legend_handles_labels()
-    ax3.legend(lines + labels, lines2 + labels2, loc='upper left')
-
-    # Chart 4: Capital
-    ax4 = axes[3]
-    if len(equity) > 0:
-        ax4.stackplot(dates, equity/1e9, debt/1e9, labels=['Equity', 'Debt'], alpha=0.7)
-        ax4.set_ylabel('Capital ($B)', fontweight='bold')
-        ax4.set_title('Capital Structure (Debt vs Equity)', fontsize=12, fontweight='bold')
-        ax4.legend(loc='upper left')
-
-    for ax in axes:
+    for ax in [ax1, ax2]:
         ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
         ax.grid(True, linestyle='--', alpha=0.5)
 
     return fig
 
-
-def plot_options_forecast(data, ticker):
-    current_price = data['current_price']
-    stock = yf.Ticker(ticker) 
-    history = data['history'].iloc[-252:] 
-
-    iv = None
-    vol_source = "HV"
-    try:
-        exp_dates = stock.options
-        if exp_dates:
-            chain = stock.option_chain(exp_dates[0])
-            calls_iv = chain.calls[(chain.calls['strike'] >= current_price*0.9) & (chain.calls['strike'] <= current_price*1.1)]['impliedVolatility'].mean()
-            puts_iv = chain.puts[(chain.puts['strike'] >= current_price*0.9) & (chain.puts['strike'] <= current_price*1.1)]['impliedVolatility'].mean()
-            iv_market = (calls_iv + puts_iv) / 2
-            if not pd.isna(iv_market) and iv_market > 0.05: 
-                iv = iv_market
-                vol_source = "IV"
-    except Exception: pass
-    
-    if iv is None or pd.isna(iv) or iv <= 0.05:
-        try:
-            returns = np.log(history['Close'] / history['Close'].shift(1))
-            iv = returns.std() * np.sqrt(252)
-            vol_source = "HV"
-            if iv < 0.05: iv = 0.3
-        except:
-            iv = 0.3
-            vol_source = "Default"
-
-    days_forward = [7, 30, 60, 90, 120] 
-    future_dates = [datetime.now() + timedelta(days=d) for d in days_forward]
-    
-    upper_prices = [current_price * np.exp(iv * np.sqrt(d/365)) for d in days_forward]
-    lower_prices = [current_price * np.exp(-iv * np.sqrt(d/365)) for d in days_forward]
-    
-    fig, ax = plt.subplots(figsize=(10, 6))
-    recent_history = history.iloc[-90:]
-    ax.plot(recent_history.index, recent_history['Close'], label='History', linewidth=2)
-    
-    last_date = recent_history.index[-1]
-    all_dates = [last_date] + future_dates
-    all_upper = [current_price] + upper_prices
-    all_lower = [current_price] + lower_prices
-    ax.plot(all_dates, all_upper, '--', label=f'Upper (+1std)')
-    ax.plot(all_dates, all_lower, '--', label=f'Lower (-1std)')
-    ax.fill_between(all_dates, all_lower, all_upper, alpha=0.2)
-    
-    ax.scatter([last_date], [current_price], s=80, zorder=5)
-
-    for date, price in zip(future_dates, upper_prices):
-        ax.text(date, price*1.01, f'${price:.0f}', ha='center', va='bottom', fontsize=8)
-    for date, price in zip(future_dates, lower_prices):
-        ax.text(date, price*0.99, f'${price:.0f}', ha='center', va='top', fontsize=8)
-
-    ax.set_title(f'{ticker} Price Forecast ({vol_source}: {iv:.1%})', fontsize=12, fontweight='bold')
-    ax.legend(loc='upper left')
-    ax.grid(True, linestyle='--', alpha=0.5)
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d'))
-    fig.autofmt_xdate()
-    
-    return fig
-
-# --- 4. 輸出與格式化函式 ---
-
-def format_financial_df(df):
-    """格式化財報 DataFrame"""
-    if df is None or df.empty: return pd.DataFrame()
-
-    df_disp = df.copy()
-    
-    col_map = {
-        'Total Revenue': '營收 (Revenue)', 'Gross Profit': '毛利 (Gross Profit)', 'Cost Of Revenue': '營收成本', 
-        'Operating Income': '營業利益', 'Net Income': '淨利 (Net Income)', 'Basic EPS': '基本 EPS',
-        'Revenue YoY': '營收 YoY', 'Revenue QoQ': '營收 QoQ', 'Net Income YoY': '淨利 YoY', 'Net Income QoQ': '淨利 QoQ',
-        'Total Assets': '總資產', 'Total Liabilities Net Minority Interest': '總負債', 
-        'Stockholders Equity': '股東權益', 'Total Debt': '總借款',
-    }
-    
-    df_disp.index = df_disp.index.map(lambda x: col_map.get(x, x))
-
-    for col in df_disp.columns:
-        if 'YoY' in col or 'QoQ' in col:
-            df_disp[col] = df_disp[col].apply(lambda x: format_num(x, percent=True) if pd.notna(x) else '-')
-        elif 'EPS' in col:
-            df_disp[col] = df_disp[col].apply(lambda x: format_num(x, decimal=2) if pd.notna(x) else '-')
-        else:
-            df_disp[col] = df_disp[col].apply(lambda x: format_num(x, currency=True) if pd.notna(x) else '-')
-            
-    return df_disp
-
-# --- Main App ---
+# --- Main ---
 
 def main():
-    st.sidebar.title("🔍 個股分析設定")
-    ticker = st.sidebar.text_input("輸入股票代號 (如 NVDA, AAPL)", value="NVDA").upper()
-    custom_g = st.sidebar.number_input("自定義 EPS 預估成長率 (%)", min_value=-100.0, max_value=500.0, value=15.0, step=0.5)
-    run_btn = st.sidebar.button("開始分析", type="primary")
+    st.sidebar.title("個股分析")
+    ticker = st.sidebar.text_input("股票代號", "NVDA").upper()
+    custom_g = st.sidebar.number_input("自定義 EPS 成長率 (%)", value=15.0)
     
-    st.sidebar.markdown("---")
-    st.sidebar.info("本工具整合 Yahoo Finance 數據，提供估值模型、財務體質評分及技術面概覽。")
+    if st.sidebar.button("分析"):
+        data = get_stock_data(ticker)
+        if not data:
+            st.error("無法獲取數據")
+            return
 
-    if run_btn and ticker:
-        with st.spinner(f'正在深入分析 {ticker} ...'):
-            data = get_stock_data(ticker)
-            
-            if not data:
-                st.error(f"無法獲取 {ticker} 的數據，請檢查代號或稍後再試。")
-                return
+        # 計算流程
+        q_val_df, multiples, extra = get_quarterly_valuation_df(data)
+        inc_df = get_income_statement(data)
+        val_res = calculate_valuation(data, inc_df, multiples, custom_g)
+        
+        st.title(f"{ticker} 估值報告")
+        st.metric("當前股價", f"${data['current_price']:.2f}")
 
-            current_price = data['current_price']
-            key_df = get_key_indicators_df(data)
-            q_df, hist_multiples, extra = get_quarterly_valuation_df(data)
-            inc_df, bs_df = get_financial_summary_with_growth(data)
-            
-            g_decimal = custom_g / 100.0 if custom_g else None
-            val_df = calculate_valuation_models(data, inc_df, hist_multiples, extra, g_decimal)
-            
-            score, checks = analyze_health(data, inc_df)
-            
-            st.title(f"{data['info'].get('shortName', ticker)} ({ticker})")
-            
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("當前股價", f"${current_price:.2f}")
-            chg = data['info'].get('52WeekChange')
-            col2.metric("52週漲跌幅", f"{chg:.2%}" if chg else "-", delta_color="normal" if chg and chg > 0 else "inverse")
-            col3.metric("財務體質評分", f"{score} / 5")
-            beta_val = data['info'].get('beta_used', 1.0)
-            col4.metric("Beta 係數", f"{beta_val:.2f}")
+        # 1. 估值表
+        st.subheader("1. 綜合估值模型 (基於近5季倍數)")
+        if not val_res.empty:
+            st.dataframe(val_res.style.format({
+                '基礎指標': '${:,.2f}',
+                '成長率': '{:.2%}',
+                '估值下限': '${:,.2f}',
+                '估值上限': '${:,.2f}',
+                '目標價': '${:,.2f}'
+            }), use_container_width=True)
+        else:
+            st.warning("數據不足無法估值")
 
-            tab1, tab2, tab3, tab4 = st.tabs(["📊 總覽與估值", "💰 估值詳情", "📑 財務報表", "📈 趨勢圖表"])
+        # 2. 季度趨勢
+        st.subheader("2. 季度估值歷史")
+        if not q_val_df.empty:
+            st.dataframe(q_val_df.style.format({
+                '市值': format_large_num,
+                'P/E (TTM)': '{:.1f}',
+                'P/S (TTM)': '{:.1f}',
+                'P/B (MRQ)': '{:.1f}',
+                'EV/EBITDA': '{:.1f}'
+            }), use_container_width=True)
 
-            with tab1:
-                st.subheader("1. 綜合估值模型 (一年目標價)")
-                if val_df is not None and not val_df.empty:
-                    st.dataframe(val_df.style.highlight_max(axis=0, subset=['Low']), use_container_width=True)
-                    st.caption("註：估值區間基於近 5 季歷史倍數 (P/E, P/S, P/B) 平均值 ± 1 標準差推算。")
-                else:
-                    st.warning("數據不足，無法建立估值模型。")
+        # 3. 損益表 (格式修復)
+        st.subheader("3. 損益表 (單位: Billion)")
+        if not inc_df.empty:
+            format_dict = {
+                'EPS': '{:.2f}',       # EPS 兩位小數
+                '營收 YoY': '{:.2%}',  # 百分比
+                '營收 QoQ': '{:.2%}',
+                '淨利 YoY': '{:.2%}',
+                '淨利 QoQ': '{:.2%}',
+                '營收': format_large_num,
+                '淨利': format_large_num,
+                '毛利': format_large_num,
+                '營業利益': format_large_num
+            }
+            st.dataframe(inc_df.style.format(format_dict, na_rep="-"), use_container_width=True)
 
-                st.subheader("2. 財務體質診斷")
-                cols_health = st.columns(2)
-                for i, (icon, msg) in enumerate(checks):
-                    with cols_health[i % 2]:
-                        if icon == "✅": st.success(f"{icon} {msg}")
-                        elif icon == "⚠️": st.warning(f"{icon} {msg}")
-                        else: st.info(f"{icon} {msg}")
-
-                st.subheader("3. 關鍵指標")
-                st.dataframe(key_df, height=400, hide_index=True)
-
-            with tab2:
-                st.subheader("季度估值歷史 (TTM/MRQ)")
-                if q_df is not None and not q_df.empty:
-                    st.dataframe(q_df, use_container_width=True)
-                else:
-                    st.info("無足夠歷史數據。")
-
-            with tab3:
-                st.subheader("損益表 (Income Statement)")
-                if inc_df is not None:
-                    st.dataframe(format_financial_df(inc_df), use_container_width=True)
-                else:
-                    st.info("無法獲取損益表數據。")
-                
-                st.subheader("資產負債表摘要 (Balance Sheet)")
-                if not bs_df.empty:
-                    st.dataframe(format_financial_df(bs_df), use_container_width=True)
-
-            with tab4:
-                col_chart1, col_chart2 = st.columns(2)
-                with col_chart1:
-                    st.markdown("##### 財務趨勢分析")
-                    fig_trends = plot_financial_trends(data, inc_df, bs_df, ticker)
-                    if fig_trends: st.pyplot(fig_trends)
-                    else: st.write("無足夠數據繪製趨勢圖。")
-
-                with col_chart2:
-                    st.markdown("##### 期權/波動率股價預測")
-                    fig_opt = plot_options_forecast(data, ticker)
-                    st.pyplot(fig_opt)
-                    st.caption("預測區間基於隱含波動率 (IV) 或歷史波動率 (HV) 計算之 68% 信賴區間 (±1σ)。")
+        # 4. 圖表
+        st.subheader("4. 趨勢圖表")
+        fig = plot_charts(data, inc_df, ticker)
+        if fig: st.pyplot(fig)
 
 if __name__ == "__main__":
     main()
