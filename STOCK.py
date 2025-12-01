@@ -32,6 +32,7 @@ def format_num(value, currency=False, percent=False, decimal=2):
 # --- 1. 資料獲取層 ---
 
 def calculate_one_year_beta(ticker):
+    """計算 1 年期 Beta (非快取，供獨立調用)"""
     period = "1y"
     try:
         stock_history = yf.download(ticker, period=period, progress=False, auto_adjust=True)
@@ -41,7 +42,6 @@ def calculate_one_year_beta(ticker):
 
         stock_close = stock_history['Close'] if 'Close' in stock_history.columns else stock_history.iloc[:, 0]
         market_close = market_history['Close'] if 'Close' in market_history.columns else market_history.iloc[:, 0]
-        
         if isinstance(stock_close, pd.DataFrame): stock_close = stock_close.iloc[:, 0]
         if isinstance(market_close, pd.DataFrame): market_close = market_close.iloc[:, 0]
 
@@ -60,14 +60,12 @@ def calculate_one_year_beta(ticker):
     except Exception:
         return None
 
-# 快取數據以提升效能
 @st.cache_data(ttl=3600)
 def get_stock_data(ticker):
     try:
         stock = yf.Ticker(ticker)
         info = stock.info
         
-        # 獲取 3 年歷史數據
         history = stock.history(period="3y", interval="1d", auto_adjust=True) 
         
         financials_q = stock.quarterly_financials
@@ -84,6 +82,7 @@ def get_stock_data(ticker):
             info['beta_used'] = beta_5y
             info['beta_label'] = "Beta (5Y)"
         else:
+            # Beta 獨立計算，避免快取錯誤
             beta_1y = calculate_one_year_beta(ticker)
             info['beta_used'] = beta_1y if beta_1y else 1.0
             info['beta_label'] = "Beta (1Y)"
@@ -95,13 +94,12 @@ def get_stock_data(ticker):
             'cashflow_q': cashflow_q,
             'current_price': current_price,
             'history': history,
-            # stock object 不快取，避免 pickle 問題
         }
     except Exception as e:
         print(f"Error fetching data: {e}")
         return None
 
-# --- 2. 數據處理邏輯 ---
+# --- 2. 數據處理與估值邏輯 ---
 
 def get_key_indicators_df(data):
     info = data['info']
@@ -134,10 +132,10 @@ def get_quarterly_valuation_df(data):
     if 'Net Income' not in fq.index or len(fq.columns) < 5:
         return None, {}, {}
 
-    # 計算 TTM 淨利與營收 (智慧填補)
     net_income_q = fq.loc['Net Income'].sort_index(ascending=True)
     rev_q = fq.loc['Total Revenue'].sort_index(ascending=True) if 'Total Revenue' in fq.index else pd.Series()
     
+    # 計算 TTM (智慧填補)
     ttm_net_income = net_income_q.rolling(window=4).sum().fillna(net_income_q * 4).sort_index(ascending=False)
     ttm_rev = rev_q.rolling(window=4).sum().fillna(rev_q * 4).sort_index(ascending=False)
 
@@ -251,7 +249,6 @@ def get_financial_summary_with_growth(data):
     bs_rows = [r for r in bs_rows if r in bq.index]
     bs_df = bq.loc[bs_rows, bq.columns.intersection(recent_cols)]
 
-    # 格式化
     fmt_cols = [d.strftime('%Y-%m-%d') for d in recent_cols]
     if not income_df.empty: income_df.columns = fmt_cols
     if not bs_df.empty: bs_df.columns = fmt_cols
@@ -309,7 +306,7 @@ def calculate_valuation_models(data, income_df, historical_multiples, extra_data
             '成長率': f"{g:.1%}",
             '倍數區間 (Avg±SD)': f"{avg:.1f}x ± {std:.1f}",
             '預估股價區間': f"${price_low:.2f} - ${price_high:.2f}",
-            'Low': price_low
+            'Low': price_low, 
         })
 
     add_model("P/E (本益比)", ttm_eps, ni_growth, historical_multiples.get('PE'), "EPS")
@@ -398,30 +395,26 @@ def plot_financial_trends(data, income_df, bs_df, ticker):
         except: market_caps.append(np.nan)
     market_caps = np.array(market_caps)
     
-    # 計算 P/S
     rev_float = rev.astype(float)
     ps_ratio = np.divide(market_caps, (rev_float * 4), out=np.full_like(market_caps, np.nan), where=rev_float>0)
 
-    # 計算 Margins
     gross_margin = np.divide(gross, rev_float, out=np.zeros_like(rev_float), where=rev_float>0) * 100
     op_margin = np.divide(op_inc, rev_float, out=np.zeros_like(rev_float), where=rev_float>0) * 100
     net_margin = np.divide(net_inc, rev_float, out=np.zeros_like(rev_float), where=rev_float>0) * 100
-    if np.all(gross == 0): gross_margin[:] = np.nan # 隱藏無效毛利
+    if np.all(gross == 0): gross_margin[:] = np.nan
 
     fig, axes = plt.subplots(4, 1, figsize=(10, 20))
     plt.subplots_adjust(hspace=0.4)
 
-    # Chart 1: Revenue & P/S (獨立軸)
+    # Chart 1: Revenue & P/S
     ax1 = axes[0]
     ax1.bar(dates, rev/1e9, color='#A8D5BA', label='Revenue (B)', width=20, alpha=0.8)
     ax1.set_ylabel('Revenue ($B)', color='#2E8B57', fontweight='bold')
     
-    # 檢查 PS 數據有效性
     if not np.isnan(ps_ratio).all() and np.nanmax(ps_ratio) > 0:
         ax1_r = ax1.twinx()
         ax1_r.plot(dates, ps_ratio, color='#3D405B', marker='o', linestyle='-', linewidth=2, label='P/S Ratio')
         ax1_r.set_ylabel('P/S Ratio', color='#3D405B', fontweight='bold')
-        # 合併圖例
         lines, labels = ax1.get_legend_handles_labels()
         lines2, labels2 = ax1_r.get_legend_handles_labels()
         ax1.legend(lines + lines2, labels + labels2, loc='upper left')
@@ -448,8 +441,6 @@ def plot_financial_trends(data, income_df, bs_df, ticker):
     ax3_r.plot(dates, eps, color='#D4A373', marker='o', linewidth=2, label='EPS')
     ax3_r.set_ylabel('EPS ($)', color='#D4A373', fontweight='bold')
     ax3.set_title('淨利與 EPS 趨勢', fontsize=12, fontweight='bold')
-    
-    # 合併圖例
     lines, labels = ax3.get_legend_handles_labels()
     lines2, labels2 = ax3_r.get_legend_handles_labels()
     ax3.legend(lines + lines2, labels + labels2, loc='upper left')
@@ -470,7 +461,6 @@ def plot_financial_trends(data, income_df, bs_df, ticker):
 
 def plot_options_forecast(data, ticker):
     current_price = data['current_price']
-    # 這裡需要重新獲取 Ticker 物件以避免 pickle 問題 (如果使用 cache)
     stock = yf.Ticker(ticker) 
     history = data['history'].iloc[-252:] 
 
@@ -512,7 +502,6 @@ def plot_options_forecast(data, ticker):
     all_dates = [last_date] + future_dates
     all_upper = [current_price] + upper_prices
     all_lower = [current_price] + lower_prices
-    
     ax.plot(all_dates, all_upper, '--', color='#E07A5F', label=f'預估上界 (+1σ)', alpha=0.8)
     ax.plot(all_dates, all_lower, '--', color='#81B29A', label=f'預估下界 (-1σ)', alpha=0.8)
     ax.fill_between(all_dates, all_lower, all_upper, color='#F2CC8F', alpha=0.2)
