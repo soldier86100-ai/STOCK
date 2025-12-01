@@ -32,7 +32,7 @@ def format_num(value, currency=False, percent=False, decimal=2):
 # --- 1. 資料獲取層 ---
 
 def calculate_one_year_beta(ticker):
-    """計算 1 年期 Beta (非快取，供獨立調用)"""
+    """計算 1 年期 Beta"""
     period = "1y"
     try:
         stock_history = yf.download(ticker, period=period, progress=False, auto_adjust=True)
@@ -82,7 +82,6 @@ def get_stock_data(ticker):
             info['beta_used'] = beta_5y
             info['beta_label'] = "Beta (5Y)"
         else:
-            # Beta 獨立計算，避免快取錯誤
             beta_1y = calculate_one_year_beta(ticker)
             info['beta_used'] = beta_1y if beta_1y else 1.0
             info['beta_label'] = "Beta (1Y)"
@@ -135,7 +134,6 @@ def get_quarterly_valuation_df(data):
     net_income_q = fq.loc['Net Income'].sort_index(ascending=True)
     rev_q = fq.loc['Total Revenue'].sort_index(ascending=True) if 'Total Revenue' in fq.index else pd.Series()
     
-    # 計算 TTM (智慧填補)
     ttm_net_income = net_income_q.rolling(window=4).sum().fillna(net_income_q * 4).sort_index(ascending=False)
     ttm_rev = rev_q.rolling(window=4).sum().fillna(rev_q * 4).sort_index(ascending=False)
 
@@ -229,7 +227,6 @@ def get_financial_summary_with_growth(data):
     
     recent_cols = fq.columns[:5]
     
-    # 構建損益表
     income_rows = ['Total Revenue', 'Gross Profit', 'Cost Of Revenue', 'Operating Income', 'Net Income', 'Basic EPS']
     income_rows = [r for r in income_rows if r in fq.index]
     income_df = fq.loc[income_rows, fq.columns.intersection(recent_cols)].copy()
@@ -244,7 +241,6 @@ def get_financial_summary_with_growth(data):
     income_df['Net Income QoQ'] = ni_qoq.reindex(income_df.index).values
     income_df = income_df.T
 
-    # 構建資產負債表
     bs_rows = ['Total Assets', 'Total Liabilities Net Minority Interest', 'Stockholders Equity', 'Total Debt']
     bs_rows = [r for r in bs_rows if r in bq.index]
     bs_df = bq.loc[bs_rows, bq.columns.intersection(recent_cols)]
@@ -406,7 +402,7 @@ def plot_financial_trends(data, income_df, bs_df, ticker):
     fig, axes = plt.subplots(4, 1, figsize=(10, 20))
     plt.subplots_adjust(hspace=0.4)
 
-    # Chart 1: Revenue & P/S
+    # Chart 1: Revenue & P/S (獨立軸)
     ax1 = axes[0]
     ax1.bar(dates, rev/1e9, color='#A8D5BA', label='Revenue (B)', width=20, alpha=0.8)
     ax1.set_ylabel('Revenue ($B)', color='#2E8B57', fontweight='bold')
