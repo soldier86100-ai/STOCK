@@ -10,13 +10,11 @@ from datetime import datetime, timedelta
 st.set_page_config(
     page_title="個股估值與財報儀表板",
     page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    layout="wide"
 )
 
 # --- 設定繪圖風格與字型 ---
 plt.style.use('seaborn-v0_8-whitegrid') 
-# 設定中文字型 (Streamlit Cloud 或不同環境可能需要額外設定字型，這裡使用通用設定)
 plt.rcParams['font.sans-serif'] = ['Noto Sans CJK TC', 'Microsoft JhengHei', 'Arial Unicode MS', 'SimHei', 'sans-serif']
 plt.rcParams['axes.unicode_minus'] = False 
 
@@ -31,7 +29,7 @@ def format_num(value, currency=False, percent=False, decimal=2):
         return f'${value:,.0f}'
     return f'{value:,.{decimal}f}'
 
-# --- 1. 資料獲取層 (使用 st.cache_data 優化效能) ---
+# --- 1. 資料獲取層 ---
 
 def calculate_one_year_beta(ticker):
     period = "1y"
@@ -41,9 +39,9 @@ def calculate_one_year_beta(ticker):
         
         if stock_history.empty or market_history.empty: return None
 
-        # 處理 MultiIndex
         stock_close = stock_history['Close'] if 'Close' in stock_history.columns else stock_history.iloc[:, 0]
         market_close = market_history['Close'] if 'Close' in market_history.columns else market_history.iloc[:, 0]
+        
         if isinstance(stock_close, pd.DataFrame): stock_close = stock_close.iloc[:, 0]
         if isinstance(market_close, pd.DataFrame): market_close = market_close.iloc[:, 0]
 
@@ -62,7 +60,8 @@ def calculate_one_year_beta(ticker):
     except Exception:
         return None
 
-@st.cache_data(ttl=3600) # 快取 1 小時
+# 快取數據以提升效能
+@st.cache_data(ttl=3600)
 def get_stock_data(ticker):
     try:
         stock = yf.Ticker(ticker)
@@ -96,17 +95,13 @@ def get_stock_data(ticker):
             'cashflow_q': cashflow_q,
             'current_price': current_price,
             'history': history,
-            'stock_object': stock # 注意: yfinance 物件無法被 pickle 快取，若報錯需移除此項並在外部重新建立
+            # stock object 不快取，避免 pickle 問題
         }
     except Exception as e:
-        st.error(f"獲取數據時發生錯誤: {e}")
+        print(f"Error fetching data: {e}")
         return None
 
-# 為了讓 st.cache_data 正常運作，將 stock_object 分離出來或在需要時重新建立
-def get_stock_object(ticker):
-    return yf.Ticker(ticker)
-
-# --- 2. 數據處理與估值邏輯 ---
+# --- 2. 數據處理邏輯 ---
 
 def get_key_indicators_df(data):
     info = data['info']
@@ -128,9 +123,7 @@ def get_key_indicators_df(data):
         'Fwd EPS': format_num(info.get('forwardEps')),
     }
     
-    # 轉為 DataFrame 方便顯示
-    df = pd.DataFrame(list(indicators.items()), columns=['指標', '數值'])
-    return df
+    return pd.DataFrame(list(indicators.items()), columns=['指標', '數值'])
 
 def get_quarterly_valuation_df(data):
     info = data['info']
@@ -141,20 +134,12 @@ def get_quarterly_valuation_df(data):
     if 'Net Income' not in fq.index or len(fq.columns) < 5:
         return None, {}, {}
 
+    # 計算 TTM 淨利與營收 (智慧填補)
     net_income_q = fq.loc['Net Income'].sort_index(ascending=True)
-    ttm_net_income = net_income_q.rolling(window=4).sum()
+    rev_q = fq.loc['Total Revenue'].sort_index(ascending=True) if 'Total Revenue' in fq.index else pd.Series()
     
-    # 智慧填補
-    annualized_net_income = net_income_q * 4
-    ttm_net_income = ttm_net_income.fillna(annualized_net_income)
-    ttm_net_income = ttm_net_income.sort_index(ascending=False)
-
-    # 營收填補
-    if 'Total Revenue' in fq.index:
-        rev_q = fq.loc['Total Revenue'].sort_index(ascending=True)
-        ttm_rev = rev_q.rolling(window=4).sum().fillna(rev_q * 4).sort_index(ascending=False)
-    else:
-        ttm_rev = pd.Series()
+    ttm_net_income = net_income_q.rolling(window=4).sum().fillna(net_income_q * 4).sort_index(ascending=False)
+    ttm_rev = rev_q.rolling(window=4).sum().fillna(rev_q * 4).sort_index(ascending=False)
 
     history_idx = pd.to_datetime(history.index).tz_localize(None)
     dates = sorted(ttm_net_income.index, reverse=True)[:5]
@@ -246,13 +231,11 @@ def get_financial_summary_with_growth(data):
     
     recent_cols = fq.columns[:5]
     
-    # 構建損益表 DF
+    # 構建損益表
     income_rows = ['Total Revenue', 'Gross Profit', 'Cost Of Revenue', 'Operating Income', 'Net Income', 'Basic EPS']
-    # 確保行存在
     income_rows = [r for r in income_rows if r in fq.index]
     income_df = fq.loc[income_rows, fq.columns.intersection(recent_cols)].copy()
     
-    # 補 Gross Profit
     if 'Gross Profit' not in income_df.index and 'Total Revenue' in income_df.index and 'Cost Of Revenue' in income_df.index:
         income_df.loc['Gross Profit'] = income_df.loc['Total Revenue'] - income_df.loc['Cost Of Revenue']
 
@@ -263,12 +246,12 @@ def get_financial_summary_with_growth(data):
     income_df['Net Income QoQ'] = ni_qoq.reindex(income_df.index).values
     income_df = income_df.T
 
-    # 構建資產負債表 DF
+    # 構建資產負債表
     bs_rows = ['Total Assets', 'Total Liabilities Net Minority Interest', 'Stockholders Equity', 'Total Debt']
     bs_rows = [r for r in bs_rows if r in bq.index]
     bs_df = bq.loc[bs_rows, bq.columns.intersection(recent_cols)]
 
-    # 格式化欄位
+    # 格式化
     fmt_cols = [d.strftime('%Y-%m-%d') for d in recent_cols]
     if not income_df.empty: income_df.columns = fmt_cols
     if not bs_df.empty: bs_df.columns = fmt_cols
@@ -280,7 +263,6 @@ def calculate_valuation_models(data, income_df, historical_multiples, extra_data
     shares = extra_data.get('shares', 1)
     ttm_eps = info.get('trailingEps')
     
-    # RPS / BVPS
     try:
         rev_ttm = data['financials_q'].loc['Total Revenue'].iloc[:4].sum()
         ttm_rps = rev_ttm / shares
@@ -291,7 +273,6 @@ def calculate_valuation_models(data, income_df, historical_multiples, extra_data
         bvps = equity / shares
     except: bvps = info.get('bookValue')
 
-    # 成長率
     def get_growth(row_name, info_key):
         rate = np.nan
         try:
@@ -328,8 +309,7 @@ def calculate_valuation_models(data, income_df, historical_multiples, extra_data
             '成長率': f"{g:.1%}",
             '倍數區間 (Avg±SD)': f"{avg:.1f}x ± {std:.1f}",
             '預估股價區間': f"${price_low:.2f} - ${price_high:.2f}",
-            'Low': price_low, # 為了後續排序或計算 Upside
-            'High': price_high
+            'Low': price_low
         })
 
     add_model("P/E (本益比)", ttm_eps, ni_growth, historical_multiples.get('PE'), "EPS")
@@ -348,7 +328,6 @@ def analyze_health(data, income_df):
     score = 0
     checks = []
     
-    # 1. ROE
     roe = info.get('returnOnEquity', 0)
     if roe and roe > 0.15:
         score += 1
@@ -356,7 +335,6 @@ def analyze_health(data, income_df):
     else:
         checks.append(("⚠️", f"ROE 偏低: {roe:.1%}" if roe else "無 ROE 數據"))
         
-    # 2. 淨利率
     pm = info.get('profitMargins', 0)
     if pm > 0.10:
         score += 1
@@ -364,7 +342,6 @@ def analyze_health(data, income_df):
     else:
         checks.append(("⚠️", f"淨利率偏低: {pm:.1%}"))
 
-    # 3. 營收成長 (YoY)
     try:
         rev_yoy = income_df.loc['Revenue YoY'].iloc[0]
         if rev_yoy > 0:
@@ -375,7 +352,6 @@ def analyze_health(data, income_df):
     except:
         checks.append(("⚪", "無法判斷營收成長"))
 
-    # 4. 負債比
     de = info.get('debtToEquity', 0)
     if de and de < 200:
         score += 1
@@ -383,7 +359,6 @@ def analyze_health(data, income_df):
     else:
         checks.append(("⚠️", f"負債比率偏高: {de}%"))
         
-    # 5. 自由現金流
     fcf = info.get('freeCashflow', 0)
     if fcf and fcf > 0:
         score += 1
@@ -393,7 +368,7 @@ def analyze_health(data, income_df):
 
     return score, checks
 
-# --- 3. 繪圖函式 (回傳 fig 物件) ---
+# --- 3. 繪圖函式 ---
 
 def plot_financial_trends(data, income_df, bs_df, ticker):
     if income_df is None or income_df.empty: return None
@@ -436,20 +411,23 @@ def plot_financial_trends(data, income_df, bs_df, ticker):
     fig, axes = plt.subplots(4, 1, figsize=(10, 20))
     plt.subplots_adjust(hspace=0.4)
 
-    # Chart 1: Revenue & P/S
+    # Chart 1: Revenue & P/S (獨立軸)
     ax1 = axes[0]
     ax1.bar(dates, rev/1e9, color='#A8D5BA', label='Revenue (B)', width=20, alpha=0.8)
     ax1.set_ylabel('Revenue ($B)', color='#2E8B57', fontweight='bold')
     
+    # 檢查 PS 數據有效性
     if not np.isnan(ps_ratio).all() and np.nanmax(ps_ratio) > 0:
         ax1_r = ax1.twinx()
         ax1_r.plot(dates, ps_ratio, color='#3D405B', marker='o', linestyle='-', linewidth=2, label='P/S Ratio')
         ax1_r.set_ylabel('P/S Ratio', color='#3D405B', fontweight='bold')
+        # 合併圖例
         lines, labels = ax1.get_legend_handles_labels()
         lines2, labels2 = ax1_r.get_legend_handles_labels()
         ax1.legend(lines + lines2, labels + labels2, loc='upper left')
     else:
         ax1.legend(loc='upper left')
+        
     ax1.set_title(f'{ticker} - 營收與 P/S 趨勢', fontsize=12, fontweight='bold')
 
     # Chart 2: Margins
@@ -470,13 +448,15 @@ def plot_financial_trends(data, income_df, bs_df, ticker):
     ax3_r.plot(dates, eps, color='#D4A373', marker='o', linewidth=2, label='EPS')
     ax3_r.set_ylabel('EPS ($)', color='#D4A373', fontweight='bold')
     ax3.set_title('淨利與 EPS 趨勢', fontsize=12, fontweight='bold')
+    
+    # 合併圖例
     lines, labels = ax3.get_legend_handles_labels()
     lines2, labels2 = ax3_r.get_legend_handles_labels()
     ax3.legend(lines + lines2, labels + labels2, loc='upper left')
 
     # Chart 4: Capital
     ax4 = axes[3]
-    if len(equity) > 0 and len(debt) > 0:
+    if len(equity) > 0:
         ax4.stackplot(dates, equity/1e9, debt/1e9, labels=['Equity', 'Debt'], colors=['#A8D5BA', '#E07A5F'], alpha=0.7)
         ax4.set_ylabel('Capital ($B)', fontweight='bold')
         ax4.set_title('資本結構 (Debt vs Equity)', fontsize=12, fontweight='bold')
@@ -490,13 +470,12 @@ def plot_financial_trends(data, income_df, bs_df, ticker):
 
 def plot_options_forecast(data, ticker):
     current_price = data['current_price']
-    stock = get_stock_object(ticker) # 使用非快取物件以獲取期權
+    # 這裡需要重新獲取 Ticker 物件以避免 pickle 問題 (如果使用 cache)
+    stock = yf.Ticker(ticker) 
     history = data['history'].iloc[-252:] 
 
     iv = None
     vol_source = "歷史波動率 (HV)"
-    
-    # 嘗試獲取 IV
     try:
         exp_dates = stock.options
         if exp_dates:
@@ -509,7 +488,6 @@ def plot_options_forecast(data, ticker):
                 vol_source = "期權市場 IV"
     except Exception: pass
     
-    # Fallback to HV
     if iv is None or pd.isna(iv) or iv <= 0.05:
         try:
             returns = np.log(history['Close'] / history['Close'].shift(1))
@@ -557,14 +535,12 @@ def plot_options_forecast(data, ticker):
 # --- Main App ---
 
 def main():
-    # Sidebar
     st.sidebar.title("🔍 個股分析設定")
-    ticker = st.sidebar.text_input("輸入股票代號 (如 NVDA, AAPL, 2330.TW)", value="NVDA").upper()
+    ticker = st.sidebar.text_input("輸入股票代號 (如 NVDA, AAPL)", value="NVDA").upper()
     custom_g = st.sidebar.number_input("自定義 EPS 預估成長率 (%)", min_value=-100.0, max_value=500.0, value=15.0, step=0.5)
     run_btn = st.sidebar.button("開始分析", type="primary")
     
     st.sidebar.markdown("---")
-    st.sidebar.markdown("### 說明")
     st.sidebar.info("本工具整合 Yahoo Finance 數據，提供估值模型、財務體質評分及技術面概覽。")
 
     if run_btn and ticker:
@@ -572,39 +548,29 @@ def main():
             data = get_stock_data(ticker)
             
             if not data:
-                st.error(f"無法獲取 {ticker} 的數據，請檢查代號是否正確或稍後再試。")
+                st.error(f"無法獲取 {ticker} 的數據，請檢查代號或稍後再試。")
                 return
 
-            # 計算所有數據
             current_price = data['current_price']
             key_df = get_key_indicators_df(data)
             q_df, hist_multiples, extra = get_quarterly_valuation_df(data)
             inc_df, bs_df = get_financial_summary_with_growth(data)
             
-            # 確保自定義成長率轉為小數
             g_decimal = custom_g / 100.0 if custom_g else None
             val_df = calculate_valuation_models(data, inc_df, hist_multiples, extra, g_decimal)
             
             score, checks = analyze_health(data, inc_df)
             
-            # --- UI 呈現 ---
             st.title(f"{data['info'].get('shortName', ticker)} ({ticker})")
             
-            # 頂部 Metrics
             col1, col2, col3, col4 = st.columns(4)
             col1.metric("當前股價", f"${current_price:.2f}")
-            
-            # 漲跌幅顏色
             chg = data['info'].get('52WeekChange')
             col2.metric("52週漲跌幅", f"{chg:.2%}" if chg else "-", delta_color="normal" if chg and chg > 0 else "inverse")
-            
             col3.metric("財務體質評分", f"{score} / 5")
-            
-            # Beta
             beta_val = data['info'].get('beta_used', 1.0)
             col4.metric("Beta 係數", f"{beta_val:.2f}")
 
-            # Tabs
             tab1, tab2, tab3, tab4 = st.tabs(["📊 總覽與估值", "💰 估值詳情", "📑 財務報表", "📈 趨勢圖表"])
 
             with tab1:
@@ -619,12 +585,9 @@ def main():
                 cols_health = st.columns(2)
                 for i, (icon, msg) in enumerate(checks):
                     with cols_health[i % 2]:
-                        if icon == "✅":
-                            st.success(f"{icon} {msg}")
-                        elif icon == "⚠️":
-                            st.warning(f"{icon} {msg}")
-                        else:
-                            st.info(f"{icon} {msg}")
+                        if icon == "✅": st.success(f"{icon} {msg}")
+                        elif icon == "⚠️": st.warning(f"{icon} {msg}")
+                        else: st.info(f"{icon} {msg}")
 
                 st.subheader("3. 關鍵指標")
                 st.dataframe(key_df, height=400, hide_index=True)
@@ -639,7 +602,6 @@ def main():
             with tab3:
                 st.subheader("損益表 (Income Statement)")
                 if inc_df is not None:
-                    # 格式化顯示
                     st.dataframe(inc_df.style.format(na_rep="-"), use_container_width=True)
                 else:
                     st.info("無法獲取損益表數據。")
@@ -650,14 +612,11 @@ def main():
 
             with tab4:
                 col_chart1, col_chart2 = st.columns(2)
-                
                 with col_chart1:
                     st.markdown("##### 財務趨勢分析")
                     fig_trends = plot_financial_trends(data, inc_df, bs_df, ticker)
-                    if fig_trends:
-                        st.pyplot(fig_trends)
-                    else:
-                        st.write("無足夠數據繪製趨勢圖。")
+                    if fig_trends: st.pyplot(fig_trends)
+                    else: st.write("無足夠數據繪製趨勢圖。")
 
                 with col_chart2:
                     st.markdown("##### 期權/波動率股價預測")
