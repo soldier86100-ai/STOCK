@@ -15,11 +15,12 @@ st.set_page_config(
 
 # --- 設定繪圖風格 ---
 plt.style.use('seaborn-v0_8-whitegrid')
-plt.rcParams['font.family'] = ['sans-serif'] # 避免中文字型報錯
+plt.rcParams['font.family'] = ['sans-serif'] 
 plt.rcParams['axes.unicode_minus'] = False
 
 # --- 共用工具函式 ---
 def format_num(value, currency=False, percent=False, decimal=2):
+    """通用數值格式化函式"""
     if value is None or pd.isna(value): return '-'
     if percent: return f'{value*100:+.{decimal}f}%'
     if currency:
@@ -67,7 +68,6 @@ def get_stock_data(ticker):
         stock = yf.Ticker(ticker)
         info = stock.info
         
-        # 獲取 3 年歷史數據
         history = stock.history(period="3y", interval="1d", auto_adjust=True) 
         
         financials_q = stock.quarterly_financials
@@ -124,7 +124,6 @@ def get_key_indicators_df(data):
     return pd.DataFrame(list(indicators.items()), columns=['指標', '數值'])
 
 def get_quarterly_valuation_df(data):
-    """計算季度估值 (智慧填補 TTM)"""
     info = data['info']
     history = data['history']
     shares = info.get('sharesOutstanding', 1)
@@ -133,11 +132,9 @@ def get_quarterly_valuation_df(data):
     if 'Net Income' not in fq.index or len(fq.columns) < 5:
         return None, {}, {}
 
-    # 1. 準備數據
     net_income_q = fq.loc['Net Income'].sort_index(ascending=True)
     rev_q = fq.loc['Total Revenue'].sort_index(ascending=True) if 'Total Revenue' in fq.index else pd.Series()
     
-    # 2. 計算 TTM (若無則用年化填補)
     ttm_net_income = net_income_q.rolling(window=4).sum().fillna(net_income_q * 4).sort_index(ascending=False)
     ttm_rev = rev_q.rolling(window=4).sum().fillna(rev_q * 4).sort_index(ascending=False)
 
@@ -166,15 +163,22 @@ def get_quarterly_valuation_df(data):
         
         equity = get_val(data['balance_sheet_q'], ['Stockholders Equity', 'Total Equity Gross Minority Interest'])
         ebitda = get_val(data['financials_q'], ['Ebitda', 'EBITDA'])
-        debt = get_val(data['balance_sheet_q'], 'Total Debt')
-        cash = get_val(data['balance_sheet_q'], ['Cash', 'Cash And Cash Equivalents'])
         
         mc = quarter_price * shares
-        ev = mc + (debt if pd.notna(debt) else 0) - (cash if pd.notna(cash) else 0)
         
+        # P/E (TTM)
         pe = mc / net_inc_val if pd.notna(net_inc_val) and net_inc_val > 0 else np.nan
+        
+        # P/S (TTM)
         ps = mc / rev_val if pd.notna(rev_val) and rev_val > 0 else np.nan
+        
+        # P/B (MRQ)
         pb = mc / equity if pd.notna(equity) and equity > 0 else np.nan
+
+        # EV/EBITDA (Annualized)
+        debt = get_val(data['balance_sheet_q'], 'Total Debt')
+        cash = get_val(data['balance_sheet_q'], ['Cash', 'Cash And Cash Equivalents'])
+        ev = mc + (debt if pd.notna(debt) else 0) - (cash if pd.notna(cash) else 0)
         ev_ebitda = ev / (ebitda * 4) if pd.notna(ebitda) and ebitda > 0 else np.nan
 
         if pd.notna(pe): historical_multiples['PE'].append(pe)
@@ -231,11 +235,11 @@ def get_financial_summary_with_growth(data):
     
     recent_cols = fq.columns[:5]
     
+    # 構建損益表
     income_rows = ['Total Revenue', 'Gross Profit', 'Cost Of Revenue', 'Operating Income', 'Net Income', 'Basic EPS']
     income_rows = [r for r in income_rows if r in fq.index]
     income_df = fq.loc[income_rows, fq.columns.intersection(recent_cols)].copy()
     
-    # 補 Gross Profit
     if 'Gross Profit' not in income_df.index and 'Total Revenue' in income_df.index and 'Cost Of Revenue' in income_df.index:
         income_df.loc['Gross Profit'] = income_df.loc['Total Revenue'] - income_df.loc['Cost Of Revenue']
 
@@ -257,27 +261,32 @@ def get_financial_summary_with_growth(data):
     return income_df, bs_df
 
 def calculate_valuation_models(data, income_df, historical_multiples, extra_data, custom_g=None):
-    """估值模型 (強制使用財報數據計算基礎指標)"""
     info = data['info']
     shares = extra_data.get('shares', 1)
     
-    # 1. 基礎指標
-    try:
-        net_inc_ttm = data['financials_q'].loc['Net Income'].iloc[:4].sum()
-        ttm_eps = net_inc_ttm / shares
-    except: ttm_eps = np.nan
+    # 1. 優先使用 info 中的 TTM EPS (與 Key Indicators 一致)
+    ttm_eps = info.get('trailingEps')
     
+    # 2. 如果 info 缺失，則使用財報計算 (Sum last 4 quarters EPS)
+    # 不使用 (Net Income / Shares) 避免股數誤差
+    if pd.isna(ttm_eps):
+        try:
+            if 'Basic EPS' in data['financials_q'].index:
+                ttm_eps = data['financials_q'].loc['Basic EPS'].iloc[:4].sum()
+        except: pass
+
+    # RPS (TTM)
     try:
         rev_ttm = data['financials_q'].loc['Total Revenue'].iloc[:4].sum()
         ttm_rps = rev_ttm / shares
     except: ttm_rps = np.nan
     
+    # BVPS (MRQ)
     try:
         equity = data['balance_sheet_q'].loc['Stockholders Equity'].iloc[0]
         bvps = equity / shares
-    except: bvps = np.nan
+    except: bvps = info.get('bookValue')
 
-    # 2. 成長率
     def get_growth(row_name, info_key):
         rate = np.nan
         try:
@@ -428,6 +437,7 @@ def plot_financial_trends(data, income_df, bs_df, ticker):
         ax1.legend(lines + lines2, labels + labels2, loc='upper left')
     else:
         ax1.legend(loc='upper left')
+        
     ax1.set_title(f'{ticker} - Revenue & P/S Trend', fontsize=12, fontweight='bold')
 
     # Chart 2: Margins
@@ -450,7 +460,7 @@ def plot_financial_trends(data, income_df, bs_df, ticker):
     ax3.set_title('Net Income & EPS Trend', fontsize=12, fontweight='bold')
     lines, labels = ax3.get_legend_handles_labels()
     lines2, labels2 = ax3_r.get_legend_handles_labels()
-    ax3.legend(lines + lines2, labels + labels2, loc='upper left')
+    ax3.legend(lines + labels, lines2 + labels2, loc='upper left')
 
     # Chart 4: Capital
     ax4 = axes[3]
@@ -531,12 +541,11 @@ def plot_options_forecast(data, ticker):
 # --- 4. 輸出與格式化函式 ---
 
 def format_financial_df(df):
-    """格式化財報 DataFrame：數字轉為 B 單位"""
+    """格式化財報 DataFrame"""
     if df is None or df.empty: return pd.DataFrame()
 
     df_disp = df.copy()
     
-    # 中文映射表
     col_map = {
         'Total Revenue': '營收 (Revenue)', 'Gross Profit': '毛利 (Gross Profit)', 'Cost Of Revenue': '營收成本', 
         'Operating Income': '營業利益', 'Net Income': '淨利 (Net Income)', 'Basic EPS': '基本 EPS',
@@ -553,7 +562,7 @@ def format_financial_df(df):
         elif 'EPS' in col:
             df_disp[col] = df_disp[col].apply(lambda x: format_num(x, decimal=2) if pd.notna(x) else '-')
         else:
-            # 轉換為 B (Billion) 單位並取整數
+            # 轉換為 Billion 單位，無小數點
             df_disp[col] = df_disp[col].apply(lambda x: format_num(x, currency=True) if pd.notna(x) else '-')
             
     return df_disp
@@ -602,8 +611,7 @@ def main():
             with tab1:
                 st.subheader("1. 綜合估值模型 (一年目標價)")
                 if not val_df.empty:
-                    val_disp = val_df.copy()
-                    st.dataframe(val_disp, use_container_width=True)
+                    st.dataframe(val_df.style.highlight_max(axis=0, subset=['Low']), use_container_width=True)
                     st.caption("註：估值區間基於近 5 季歷史倍數 (P/E, P/S, P/B) 平均值 ± 1 標準差推算。")
                 else:
                     st.warning("數據不足，無法建立估值模型。")
