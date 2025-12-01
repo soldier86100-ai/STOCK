@@ -123,62 +123,88 @@ def get_key_indicators_df(data):
     
     return pd.DataFrame(list(indicators.items()), columns=['指標', '數值'])
 
+
 def get_quarterly_valuation_df(data):
+    """計算季度（用近 5 季）每股倍數（P/E, P/S, P/B），修正：以每股為基準計算倍數（price / EPS），而非直接 market_cap / net_income（避免單位或股本差異）。"""
     info = data['info']
     history = data['history']
-    shares = info.get('sharesOutstanding', 1)
+    shares = info.get('sharesOutstanding', np.nan)
     fq = data['financials_q']
+    bq = data['balance_sheet_q']
     
-    if 'Net Income' not in fq.index or len(fq.columns) < 5:
+    if 'Net Income' not in fq.index:
         return None, {}, {}
 
+    # 取得季度淨利與營收（已按時間由舊到新排序）
     net_income_q = fq.loc['Net Income'].sort_index(ascending=True)
-    rev_q = fq.loc['Total Revenue'].sort_index(ascending=True) if 'Total Revenue' in fq.index else pd.Series()
-    
-    ttm_net_income = net_income_q.rolling(window=4).sum().fillna(net_income_q * 4).sort_index(ascending=False)
-    ttm_rev = rev_q.rolling(window=4).sum().fillna(rev_q * 4).sort_index(ascending=False)
+    rev_q = fq.loc['Total Revenue'].sort_index(ascending=True) if 'Total Revenue' in fq.index else pd.Series(dtype=float)
 
-    history_idx = pd.to_datetime(history.index).tz_localize(None)
-    dates = sorted(ttm_net_income.index, reverse=True)[:5]
-    
+    # 計算 TTM（每季最後一季為基準）
+    ttm_net_income = net_income_q.rolling(window=4).sum().dropna()
+    ttm_rev = rev_q.rolling(window=4).sum().dropna()
+
+    # 取最近最多 5 個可用的 TTM 時點
+    dates = list(ttm_net_income.index)[-5:]
+    if not dates:
+        return None, {}, {}
+
     metrics_list = []
     historical_multiples = {'PE': [], 'PB': [], 'PS': []}
 
-    for date in dates:
+    history_idx = pd.to_datetime(history.index).tz_localize(None)
+
+    for date in reversed(dates):  # 從近到遠
         try:
             target_idx = history_idx.get_indexer([pd.to_datetime(date)], method='nearest')[0]
             quarter_price = history['Close'].iloc[target_idx] if target_idx != -1 else np.nan
-        except: quarter_price = np.nan
-            
-        if pd.isna(quarter_price): continue
-
-        def get_val(df, key_list):
-            if isinstance(key_list, str): key_list = [key_list]
-            for key in key_list:
-                if key in df.index: return df.loc[key, date]
-            return np.nan
+        except:
+            quarter_price = np.nan
+        if pd.isna(quarter_price):
+            continue
 
         net_inc_val = ttm_net_income.loc[date]
         rev_val = ttm_rev.loc[date] if date in ttm_rev.index else np.nan
-        
-        equity = get_val(data['balance_sheet_q'], ['Stockholders Equity', 'Total Equity Gross Minority Interest'])
-        ebitda = get_val(data['financials_q'], ['Ebitda', 'EBITDA'])
-        
-        mc = quarter_price * shares
-        
-        # P/E (TTM)
-        pe = mc / net_inc_val if pd.notna(net_inc_val) and net_inc_val > 0 else np.nan
-        
-        # P/S (TTM)
-        ps = mc / rev_val if pd.notna(rev_val) and rev_val > 0 else np.nan
-        
-        # P/B (MRQ)
-        pb = mc / equity if pd.notna(equity) and equity > 0 else np.nan
 
-        # EV/EBITDA (Annualized)
-        debt = get_val(data['balance_sheet_q'], 'Total Debt')
-        cash = get_val(data['balance_sheet_q'], ['Cash', 'Cash And Cash Equivalents'])
+        # 從資產負債表抓取當季股東權益（若有）
+        def get_val(df, key_list, idx=date):
+            if df is None or df.empty: return np.nan
+            if isinstance(key_list, str): key_list = [key_list]
+            for key in key_list:
+                if key in df.index and idx in df.columns:
+                    return df.loc[key, idx]
+            # 若同一日期找不到，嘗試用最近可用的欄位
+            for key in key_list:
+                if key in df.index:
+                    # 找最近可用欄位
+                    try:
+                        nearest = df.columns.get_indexer([idx], method='nearest')[0]
+                        return df.loc[key, df.columns[nearest]]
+                    except: pass
+            return np.nan
+
+        equity = get_val(bq, ['Stockholders Equity', 'Total Stockholder Equity', 'Total Equity Gross Minority Interest'], date)
+
+        # 計算每股數值
+        if pd.isna(shares) or shares == 0:
+            # 若 shares 無法取得，改採 info['marketCap'] 與每股替代
+            shares = info.get('sharesOutstanding', np.nan)
+
+        # EPS (TTM) 與 RPS (TTM) 以每股為基礎
+        eps_ttm = (net_inc_val / shares) if pd.notna(net_inc_val) and pd.notna(shares) and shares > 0 else np.nan
+        rps_ttm = (rev_val / shares) if pd.notna(rev_val) and pd.notna(shares) and shares > 0 else np.nan
+        bvps_mrq = (equity / shares) if pd.notna(equity) and pd.notna(shares) and shares > 0 else np.nan
+
+        # 傳統每股倍數計算（price / per-share-metric）
+        pe = quarter_price / eps_ttm if pd.notna(eps_ttm) and eps_ttm > 0 else np.nan
+        ps = quarter_price / rps_ttm if pd.notna(rps_ttm) and rps_ttm > 0 else np.nan
+        pb = quarter_price / bvps_mrq if pd.notna(bvps_mrq) and bvps_mrq > 0 else np.nan
+
+        # EV/EBITDA 保留 market-cap 方式
+        mc = quarter_price * shares if pd.notna(shares) and shares > 0 else (info.get('marketCap') or np.nan)
+        debt = get_val(bq, 'Total Debt', date)
+        cash = get_val(bq, ['Cash', 'Cash And Cash Equivalents'], date)
         ev = mc + (debt if pd.notna(debt) else 0) - (cash if pd.notna(cash) else 0)
+        ebitda = get_val(fq, ['Ebitda', 'EBITDA'], date)
         ev_ebitda = ev / (ebitda * 4) if pd.notna(ebitda) and ebitda > 0 else np.nan
 
         if pd.notna(pe): historical_multiples['PE'].append(pe)
@@ -186,15 +212,16 @@ def get_quarterly_valuation_df(data):
         if pd.notna(pb): historical_multiples['PB'].append(pb)
 
         metrics_list.append({
-            '季度': date.strftime('%Y-%m-%d'),
-            '市值': format_num(mc, currency=True),
-            'P/E (TTM)': format_num(pe, decimal=1),
-            'P/S (TTM)': format_num(ps, decimal=1),
-            'P/B (MRQ)': format_num(pb, decimal=1),
-            'EV/EBITDA': format_num(ev_ebitda, decimal=1),
+            '季度': pd.to_datetime(date).strftime('%Y-%m-%d'),
+            '價格 (當時)': f"${quarter_price:.2f}",
+            'P/E (TTM)': format_num(pe, decimal=1) if pd.notna(pe) else '-',
+            'P/S (TTM)': format_num(ps, decimal=1) if pd.notna(ps) else '-',
+            'P/B (MRQ)': format_num(pb, decimal=1) if pd.notna(pb) else '-',
+            'EV/EBITDA': format_num(ev_ebitda, decimal=1) if pd.notna(ev_ebitda) else '-',
         })
-    
+
     return pd.DataFrame(metrics_list), historical_multiples, {'shares': shares}
+
 
 def get_financial_summary_with_growth(data):
     fq = data['financials_q']
@@ -260,31 +287,33 @@ def get_financial_summary_with_growth(data):
 
     return income_df, bs_df
 
+
 def calculate_valuation_models(data, income_df, historical_multiples, extra_data, custom_g=None):
     info = data['info']
-    shares = extra_data.get('shares', 1)
+    shares = extra_data.get('shares', info.get('sharesOutstanding', np.nan))
     
     # 1. 優先使用 info 中的 TTM EPS (與 Key Indicators 一致)
     ttm_eps = info.get('trailingEps')
     
-    # 2. 如果 info 缺失，則使用財報計算 (Sum last 4 quarters EPS)
-    # 不使用 (Net Income / Shares) 避免股數誤差
-    if pd.isna(ttm_eps):
+    # 2. 如果 info 缺失，則使用財報計算 (Net Income TTM / shares)
+    if pd.isna(ttm_eps) or ttm_eps == 0:
         try:
-            if 'Basic EPS' in data['financials_q'].index:
-                ttm_eps = data['financials_q'].loc['Basic EPS'].iloc[:4].sum()
+            if 'Net Income' in data['financials_q'].index:
+                net_ttm = data['financials_q'].loc['Net Income'].iloc[:4].sum()
+                if pd.notna(net_ttm) and pd.notna(shares) and shares > 0:
+                    ttm_eps = net_ttm / shares
         except: pass
 
     # RPS (TTM)
     try:
         rev_ttm = data['financials_q'].loc['Total Revenue'].iloc[:4].sum()
-        ttm_rps = rev_ttm / shares
+        ttm_rps = rev_ttm / shares if pd.notna(shares) and shares > 0 else np.nan
     except: ttm_rps = np.nan
     
     # BVPS (MRQ)
     try:
         equity = data['balance_sheet_q'].loc['Stockholders Equity'].iloc[0]
-        bvps = equity / shares
+        bvps = equity / shares if pd.notna(shares) and shares > 0 else (info.get('bookValue') or np.nan)
     except: bvps = info.get('bookValue')
 
     def get_growth(row_name, info_key):
@@ -307,7 +336,7 @@ def calculate_valuation_models(data, income_df, historical_multiples, extra_data
         
         avg = np.mean(valid_m)
         std = np.std(valid_m)
-        if pd.isna(std): std = avg * 0.1
+        if pd.isna(std) or std == 0: std = avg * 0.1
         
         low_m = max(0, avg - std)
         high_m = avg + std
@@ -336,6 +365,7 @@ def calculate_valuation_models(data, income_df, historical_multiples, extra_data
         add_model(f"自定義 ({custom_g:.1%})", ttm_eps, custom_g, historical_multiples.get('PE'), "EPS (TTM)")
 
     return pd.DataFrame(results)
+
 
 def analyze_health(data, income_df):
     info = data['info']
@@ -430,8 +460,8 @@ def plot_financial_trends(data, income_df, bs_df, ticker):
     
     if not np.isnan(ps_ratio).all() and np.nanmax(ps_ratio) > 0:
         ax1_r = ax1.twinx()
-        ax1_r.plot(dates, ps_ratio, color='#3D405B', marker='o', linestyle='-', linewidth=2, label='P/S Ratio')
-        ax1_r.set_ylabel('P/S Ratio', color='#3D405B', fontweight='bold')
+        ax1_r.plot(dates, ps_ratio, marker='o', linestyle='-', linewidth=2, label='P/S Ratio')
+        ax1_r.set_ylabel('P/S Ratio', fontweight='bold')
         lines, labels = ax1.get_legend_handles_labels()
         lines2, labels2 = ax1_r.get_legend_handles_labels()
         ax1.legend(lines + lines2, labels + labels2, loc='upper left')
@@ -455,8 +485,8 @@ def plot_financial_trends(data, income_df, bs_df, ticker):
     ax3.bar(dates, net_inc/1e9, color='#87CEFA', label='Net Income (B)', width=20, alpha=0.8)
     ax3.set_ylabel('Net Income ($B)', color='#2E8B57', fontweight='bold')
     ax3_r = ax3.twinx()
-    ax3_r.plot(dates, eps, color='#D4A373', marker='o', linewidth=2, label='EPS')
-    ax3_r.set_ylabel('EPS ($)', color='#D4A373', fontweight='bold')
+    ax3_r.plot(dates, eps, marker='o', linewidth=2, label='EPS')
+    ax3_r.set_ylabel('EPS ($)', fontweight='bold')
     ax3.set_title('Net Income & EPS Trend', fontsize=12, fontweight='bold')
     lines, labels = ax3.get_legend_handles_labels()
     lines2, labels2 = ax3_r.get_legend_handles_labels()
@@ -465,7 +495,7 @@ def plot_financial_trends(data, income_df, bs_df, ticker):
     # Chart 4: Capital
     ax4 = axes[3]
     if len(equity) > 0:
-        ax4.stackplot(dates, equity/1e9, debt/1e9, labels=['Equity', 'Debt'], colors=['#A8D5BA', '#E07A5F'], alpha=0.7)
+        ax4.stackplot(dates, equity/1e9, debt/1e9, labels=['Equity', 'Debt'], alpha=0.7)
         ax4.set_ylabel('Capital ($B)', fontweight='bold')
         ax4.set_title('Capital Structure (Debt vs Equity)', fontsize=12, fontweight='bold')
         ax4.legend(loc='upper left')
@@ -475,6 +505,7 @@ def plot_financial_trends(data, income_df, bs_df, ticker):
         ax.grid(True, linestyle='--', alpha=0.5)
 
     return fig
+
 
 def plot_options_forecast(data, ticker):
     current_price = data['current_price']
@@ -513,18 +544,18 @@ def plot_options_forecast(data, ticker):
     
     fig, ax = plt.subplots(figsize=(10, 6))
     recent_history = history.iloc[-90:]
-    ax.plot(recent_history.index, recent_history['Close'], label='History', color='#3D405B', linewidth=2)
+    ax.plot(recent_history.index, recent_history['Close'], label='History', linewidth=2)
     
     last_date = recent_history.index[-1]
     all_dates = [last_date] + future_dates
     all_upper = [current_price] + upper_prices
     all_lower = [current_price] + lower_prices
-    ax.plot(all_dates, all_upper, '--', color='#E07A5F', label=f'Upper (+1std)')
-    ax.plot(all_dates, all_lower, '--', color='#81B29A', label=f'Lower (-1std)')
-    ax.fill_between(all_dates, all_lower, all_upper, color='#F2CC8F', alpha=0.2)
+    ax.plot(all_dates, all_upper, '--', label=f'Upper (+1std)')
+    ax.plot(all_dates, all_lower, '--', label=f'Lower (-1std)')
+    ax.fill_between(all_dates, all_lower, all_upper, alpha=0.2)
     
-    ax.scatter([last_date], [current_price], color='#E07A5F', s=80, zorder=5)
-    
+    ax.scatter([last_date], [current_price], s=80, zorder=5)
+
     for date, price in zip(future_dates, upper_prices):
         ax.text(date, price*1.01, f'${price:.0f}', ha='center', va='bottom', fontsize=8)
     for date, price in zip(future_dates, lower_prices):
@@ -562,7 +593,6 @@ def format_financial_df(df):
         elif 'EPS' in col:
             df_disp[col] = df_disp[col].apply(lambda x: format_num(x, decimal=2) if pd.notna(x) else '-')
         else:
-            # 轉換為 Billion 單位，無小數點
             df_disp[col] = df_disp[col].apply(lambda x: format_num(x, currency=True) if pd.notna(x) else '-')
             
     return df_disp
@@ -579,7 +609,7 @@ def main():
     st.sidebar.info("本工具整合 Yahoo Finance 數據，提供估值模型、財務體質評分及技術面概覽。")
 
     if run_btn and ticker:
-        with st.spinner(f'正在深入分析 {ticker} ... 請稍候'):
+        with st.spinner(f'正在深入分析 {ticker} ...'):
             data = get_stock_data(ticker)
             
             if not data:
@@ -610,7 +640,7 @@ def main():
 
             with tab1:
                 st.subheader("1. 綜合估值模型 (一年目標價)")
-                if not val_df.empty:
+                if val_df is not None and not val_df.empty:
                     st.dataframe(val_df.style.highlight_max(axis=0, subset=['Low']), use_container_width=True)
                     st.caption("註：估值區間基於近 5 季歷史倍數 (P/E, P/S, P/B) 平均值 ± 1 標準差推算。")
                 else:
@@ -629,7 +659,7 @@ def main():
 
             with tab2:
                 st.subheader("季度估值歷史 (TTM/MRQ)")
-                if q_df is not None:
+                if q_df is not None and not q_df.empty:
                     st.dataframe(q_df, use_container_width=True)
                 else:
                     st.info("無足夠歷史數據。")
